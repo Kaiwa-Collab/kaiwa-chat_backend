@@ -14,22 +14,19 @@ const cors = require('cors');
 // Initialize Firebase Admin
 let serviceAccount;
 
-if (process.env.FIREBASE_CONFIG) {
-  // Production: Use environment variable
-  try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
-  } catch (error) {
-    console.error('Failed to parse FIREBASE_CONFIG:', error);
-    process.exit(1);
-  }
-} else {
-  // Development: Use local file
-  try {
-    serviceAccount = require('./serviceAccountKey.json');
-  } catch (error) {
-    console.error('serviceAccountKey.json not found. Set FIREBASE_CONFIG environment variable.');
-    process.exit(1);
-  }
+if (!process.env.FIREBASE_CONFIG) {
+  console.error('FIREBASE_CONFIG not set');
+  process.exit(1);
+}
+
+try {
+  serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
+  serviceAccount.private_key =
+    serviceAccount.private_key.replace(/\\n/g, '\n');
+  console.log('Firebase config loaded');
+} catch (err) {
+  console.error('Invalid FIREBASE_CONFIG JSON', err);
+  process.exit(1);
 }
 
 admin.initializeApp({
