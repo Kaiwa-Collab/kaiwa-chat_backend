@@ -11,9 +11,26 @@ const cors = require('cors');
 // Initialize Firebase Admin
 // For production: Use environment variable
 // For development: Use serviceAccountKey.json file
-const serviceAccount = process.env.FIREBASE_CONFIG 
-  ? JSON.parse(process.env.FIREBASE_CONFIG)
-  : require('./serviceAccountKey.json');
+// Initialize Firebase Admin
+let serviceAccount;
+
+if (process.env.FIREBASE_CONFIG) {
+  // Production: Use environment variable
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
+  } catch (error) {
+    console.error('Failed to parse FIREBASE_CONFIG:', error);
+    process.exit(1);
+  }
+} else {
+  // Development: Use local file
+  try {
+    serviceAccount = require('./serviceAccountKey.json');
+  } catch (error) {
+    console.error('serviceAccountKey.json not found. Set FIREBASE_CONFIG environment variable.');
+    process.exit(1);
+  }
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
