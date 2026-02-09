@@ -1,6 +1,6 @@
-// server.js
+// server.js - FINAL FIXED VERSION
 // WebSocket Chat Server with Firebase Integration
-// This reduces Firestore reads by 90%+ while maintaining real-time functionality
+// FIXES: Authentication middleware issue causing connection failures
 
 const express = require('express');
 const http = require('http');
@@ -8,9 +8,6 @@ const socketIo = require('socket.io');
 const admin = require('firebase-admin');
 const cors = require('cors');
 
-// Initialize Firebase Admin
-// For production: Use environment variable
-// For development: Use serviceAccountKey.json file
 // Initialize Firebase Admin
 let serviceAccount;
 
@@ -21,8 +18,7 @@ if (!process.env.FIREBASE_CONFIG) {
 
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
-  serviceAccount.private_key =
-    serviceAccount.private_key.replace(/\\n/g, '\n');
+  serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
   console.log('Firebase config loaded');
 } catch (err) {
   console.error('Invalid FIREBASE_CONFIG JSON', err);
@@ -54,14 +50,14 @@ const io = socketIo(server, {
   },
   pingTimeout: 60000,
   pingInterval: 25000,
-  transports: ['websocket', 'polling'], // Support both WebSocket and polling
-  allowEIO3: true // Support older clients
+  transports: ['websocket', 'polling'],
+  allowEIO3: true
 });
 
 // In-memory store for active connections
-const activeUsers = new Map(); // userId -> Set of socketIds
-const userChatRooms = new Map(); // userId -> Set of chatIds
-const chatParticipants = new Map(); // chatId -> Set of userIds
+const activeUsers = new Map();
+const userChatRooms = new Map();
+const chatParticipants = new Map();
 
 // Helper: Verify Firebase token
 async function verifyToken(token) {
@@ -87,7 +83,6 @@ async function getUserProfile(userId) {
     
     if (data) {
       userProfileCache.set(userId, data);
-      // Cache for 5 minutes
       setTimeout(() => userProfileCache.delete(userId), 5 * 60 * 1000);
     }
     
@@ -97,7 +92,7 @@ async function getUserProfile(userId) {
   }
 }
 
-// Health check endpoint (important for cloud platforms)
+// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -121,81 +116,77 @@ app.get('/', (req, res) => {
   });
 });
 
+// CRITICAL FIX: Socket.IO authentication middleware
+// This middleware runs BEFORE the 'connection' event
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
+    
     if (!token) {
-      return next(new Error('No token'));
+      console.log('❌ No token provided in handshake');
+      return next(new Error('Authentication required'));
     }
 
-    const decoded = await admin.auth().verifyIdToken(token);
-    socket.userId = decoded.uid;
-    return next();
+    console.log('🔐 Verifying token...');
+    const userId = await verifyToken(token);
+    
+    if (!userId) {
+      console.log('❌ Invalid token');
+      return next(new Error('Invalid token'));
+    }
+
+    console.log(`✅ Token verified for user: ${userId}`);
+    socket.userId = userId;
+    next();
+    
   } catch (err) {
+    console.error('❌ Auth middleware error:', err);
     return next(new Error('Authentication failed'));
   }
 });
-
 
 // Socket.io Connection Handler
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
   
-  let authenticatedUserId = null;
+  // User is already authenticated by middleware
+  const authenticatedUserId = socket.userId;
 
-  // Authentication
-  socket.on('authenticate', async (data) => {
-    const { token } = data;
-    
-    const userId = await verifyToken(token);
-    if (!userId) {
-      socket.emit('auth_error', { message: 'Invalid token' });
-      socket.disconnect();
-      return;
-    }
-    
-    authenticatedUserId = userId;
-    
-    // Track active user
-    if (!activeUsers.has(userId)) {
-      activeUsers.set(userId, new Set());
-    }
-    activeUsers.get(userId).add(socket.id);
-    
-    // Update online status in Firestore (single write)
-    try {
-      await db.collection('presence').doc(userId).set({
-        online: true,
-        lastSeen: admin.firestore.FieldValue.serverTimestamp(),
-        socketIds: admin.firestore.FieldValue.arrayUnion(socket.id)
-      }, { merge: true });
-    } catch (error) {
-      console.error('Error updating presence:', error);
-    }
-    
-    // Emit to user's contacts that they're online
-    socket.broadcast.emit('user_status_changed', {
-      userId,
-      status: 'online'
-    });
-    
-    // Send current online user IDs so client can show presence without Firestore reads
-    const onlineUserIds = Array.from(activeUsers.keys());
-    socket.emit('authenticated', { userId, onlineUserIds });
-    console.log(`User ${userId} authenticated`);
+  if (!authenticatedUserId) {
+    console.error('❌ No userId on socket - middleware failed');
+    socket.disconnect();
+    return;
+  }
+
+  // Track active user
+  if (!activeUsers.has(authenticatedUserId)) {
+    activeUsers.set(authenticatedUserId, new Set());
+  }
+  activeUsers.get(authenticatedUserId).add(socket.id);
+
+  // Update online status in Firestore
+  db.collection('presence').doc(authenticatedUserId).set({
+    online: true,
+    lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+    socketIds: admin.firestore.FieldValue.arrayUnion(socket.id)
+  }, { merge: true }).catch(err => console.error('Error updating presence:', err));
+
+  // Notify others that user is online
+  socket.broadcast.emit('user_status_changed', {
+    userId: authenticatedUserId,
+    status: 'online'
   });
+
+  // Send authenticated event with online users
+  const onlineUserIds = Array.from(activeUsers.keys());
+  socket.emit('authenticated', { userId: authenticatedUserId, onlineUserIds });
+  console.log(`✅ User ${authenticatedUserId} fully authenticated and ready`);
 
   // Join chat room
   socket.on('join_chat', async (data) => {
-    if (!authenticatedUserId) {
-      socket.emit('error', { message: 'Not authenticated' });
-      return;
-    }
-    
     const { chatId } = data;
     
     try {
-      // Verify user is participant (single read)
       const chatDoc = await db.collection('chats').doc(chatId).get();
       if (!chatDoc.exists) {
         socket.emit('error', { message: 'Chat not found' });
@@ -208,16 +199,13 @@ io.on('connection', (socket) => {
         return;
       }
       
-      // Join socket room
       socket.join(chatId);
       
-      // Track user's chats
       if (!userChatRooms.has(authenticatedUserId)) {
         userChatRooms.set(authenticatedUserId, new Set());
       }
       userChatRooms.get(authenticatedUserId).add(chatId);
       
-      // Track chat participants
       if (!chatParticipants.has(chatId)) {
         chatParticipants.set(chatId, new Set());
       }
@@ -225,7 +213,6 @@ io.on('connection', (socket) => {
       
       console.log(`User ${authenticatedUserId} joined chat ${chatId}`);
       
-      // Notify other participants that user is active in chat
       socket.to(chatId).emit('user_joined_chat', {
         userId: authenticatedUserId,
         chatId
@@ -255,33 +242,11 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Send message (real-time via WebSocket + persist to Firebase)
+  // Send message
   socket.on('send_message', async (data) => {
-    if (!authenticatedUserId) {
-      socket.emit('error', { message: 'Not authenticated' });
-      return;
-    }
-    
     const { chatId, text, mediaUrl, mediaType, tempId } = data;
     
     try {
-      // Optimistic update - emit immediately to sender
-      const optimisticMessage = {
-        id: tempId,
-        senderId: authenticatedUserId,
-        text: text || '',
-        messageType: mediaType || 'text',
-        imageUrl: mediaType === 'image' ? mediaUrl : null,
-        videoUrl: mediaType === 'video' ? mediaUrl : null,
-        createdAt: new Date().toISOString(),
-        readBy: { [authenticatedUserId]: new Date().toISOString() },
-        deliveredTo: { [authenticatedUserId]: admin.firestore.FieldValue.serverTimestamp()},
-        status: 'sending'
-      };
-      
-      // socket.emit('message_sent', optimisticMessage);
-      
-      // Persist to Firebase (single write)
       const messageRef = db.collection('chats').doc(chatId).collection('messages').doc();
       
       const messageData = {
@@ -298,35 +263,29 @@ io.on('connection', (socket) => {
       
       await messageRef.set(messageData);
       
-      // Get actual server timestamp
       const savedDoc = await messageRef.get();
       const savedData = savedDoc.data();
       
       const finalMessage = {
-  id: messageRef.id,
-  ...savedData,
-  createdAt: savedData.createdAt?.toDate().toISOString(),
-  readBy: {
-    [authenticatedUserId]:
-      savedData.readBy[authenticatedUserId]?.toDate().toISOString()
-  },
-  deliveredTo: {
-    [authenticatedUserId]: new Date().toISOString()
-  },
-  status: 'sent'
-};
+        id: messageRef.id,
+        ...savedData,
+        createdAt: savedData.createdAt?.toDate().toISOString(),
+        readBy: {
+          [authenticatedUserId]: savedData.readBy[authenticatedUserId]?.toDate().toISOString()
+        },
+        deliveredTo: {
+          [authenticatedUserId]: new Date().toISOString()
+        },
+        status: 'sent'
+      };
 
-      
-      // Emit to all participants in the chat room EXCEPT sender
+      // Emit to others in chat
       socket.to(chatId).emit('new_message', finalMessage);
       
-      // Send confirmation to sender with real ID
-      socket.emit('message_confirmed', {
-        tempId,
-        message: finalMessage
-      });
+      // Confirm to sender
+      socket.emit('message_confirmed', { tempId, message: finalMessage });
       
-      // Update last message (single write)
+      // Update last message
       await db.collection('chats').doc(chatId).update({
         lastMessage: {
           id: messageRef.id,
@@ -337,7 +296,7 @@ io.on('connection', (socket) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
-      // Emit chat updated event to all user's devices
+      // Notify all user's devices
       const participants = chatParticipants.get(chatId) || new Set();
       participants.forEach(participantId => {
         const sockets = activeUsers.get(participantId);
@@ -360,10 +319,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Mark messages as delivered (batch update)
+  // Mark messages as delivered
   socket.on('mark_delivered', async (data) => {
-    if (!authenticatedUserId) return;
-    
     const { chatId, messageIds } = data;
     
     try {
@@ -378,7 +335,6 @@ io.on('connection', (socket) => {
       
       await batch.commit();
       
-      // Notify sender that messages were delivered
       socket.to(chatId).emit('messages_delivered', {
         userId: authenticatedUserId,
         messageIds
@@ -389,10 +345,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Mark messages as read (batch update)
+  // Mark messages as read
   socket.on('mark_read', async (data) => {
-    if (!authenticatedUserId) return;
-    
     const { chatId, messageIds } = data;
     
     try {
@@ -407,7 +361,6 @@ io.on('connection', (socket) => {
       
       await batch.commit();
       
-      // Notify sender that messages were read
       socket.to(chatId).emit('messages_read', {
         userId: authenticatedUserId,
         messageIds
@@ -418,10 +371,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Typing indicator (real-time only, no DB write)
+  // Typing indicators
   socket.on('typing_start', (data) => {
-    if (!authenticatedUserId) return;
-    
     const { chatId } = data;
     socket.to(chatId).emit('user_typing', {
       userId: authenticatedUserId,
@@ -431,8 +382,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('typing_stop', (data) => {
-    if (!authenticatedUserId) return;
-    
     const { chatId } = data;
     socket.to(chatId).emit('user_typing', {
       userId: authenticatedUserId,
@@ -441,10 +390,8 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Message updated (e.g. deleted for everyone - broadcast placeholder to other participants)
+  // Message updated
   socket.on('message_updated', async (data) => {
-    if (!authenticatedUserId) return;
-
     const { chatId, message } = data;
     if (!chatId || !message) return;
 
@@ -463,51 +410,44 @@ io.on('connection', (socket) => {
   socket.on('disconnect', async () => {
     console.log('Client disconnected:', socket.id);
     
-    if (authenticatedUserId) {
-      // Remove from active users
-      const userSockets = activeUsers.get(authenticatedUserId);
-      if (userSockets) {
-        userSockets.delete(socket.id);
+    const userSockets = activeUsers.get(authenticatedUserId);
+    if (userSockets) {
+      userSockets.delete(socket.id);
+      
+      if (userSockets.size === 0) {
+        activeUsers.delete(authenticatedUserId);
         
-        // If user has no more active connections
-        if (userSockets.size === 0) {
-          activeUsers.delete(authenticatedUserId);
+        try {
+          await db.collection('presence').doc(authenticatedUserId).set({
+            online: false,
+            lastSeen: admin.firestore.FieldValue.serverTimestamp()
+          }, { merge: true });
           
-          try {
-            // Update presence (single write)
-            await db.collection('presence').doc(authenticatedUserId).set({
-              online: false,
-              lastSeen: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-            
-            // Notify contacts
-            socket.broadcast.emit('user_status_changed', {
-              userId: authenticatedUserId,
-              status: 'offline',
-              lastSeen: new Date().toISOString()
-            });
-          } catch (error) {
-            console.error('Error updating presence on disconnect:', error);
-          }
+          socket.broadcast.emit('user_status_changed', {
+            userId: authenticatedUserId,
+            status: 'offline',
+            lastSeen: new Date().toISOString()
+          });
+        } catch (error) {
+          console.error('Error updating presence on disconnect:', error);
         }
       }
-      
-      // Clean up chat rooms
-      const userChats = userChatRooms.get(authenticatedUserId);
-      if (userChats) {
-        userChats.forEach(chatId => {
-          const participants = chatParticipants.get(chatId);
-          if (participants) {
-            participants.delete(authenticatedUserId);
-          }
-        });
-        userChatRooms.delete(authenticatedUserId);
-      }
+    }
+    
+    const userChats = userChatRooms.get(authenticatedUserId);
+    if (userChats) {
+      userChats.forEach(chatId => {
+        const participants = chatParticipants.get(chatId);
+        if (participants) {
+          participants.delete(authenticatedUserId);
+        }
+      });
+      userChatRooms.delete(authenticatedUserId);
     }
   });
 });
 
-// REST API for fetching message history (pagination to reduce reads)
+// REST API for fetching message history
 app.get('/api/messages/:chatId', async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -523,7 +463,6 @@ app.get('/api/messages/:chatId', async (req, res) => {
       return res.status(401).json({ error: 'Invalid token' });
     }
     
-    // Verify user is participant
     const chatDoc = await db.collection('chats').doc(chatId).get();
     if (!chatDoc.exists || !chatDoc.data().participants.includes(userId)) {
       return res.status(403).json({ error: 'Forbidden' });
@@ -562,14 +501,12 @@ app.get('/api/messages/:chatId', async (req, res) => {
   }
 });
 
-// Use PORT from environment variable (required for most cloud platforms)
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`WebSocket server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, closing server...');
   server.close(() => {
@@ -585,11 +522,3 @@ process.on('SIGINT', () => {
     process.exit(0);
   });
 });
-
-
-
-
-
-
-
-
