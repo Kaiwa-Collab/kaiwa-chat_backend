@@ -44,25 +44,16 @@ app.use(express.json());
 // Socket.IO configuration
 const io = socketIo(server, {
   cors: {
-    origin: '*',  // ✅ Changed from process.env.ALLOWED_ORIGINS for mobile
-    methods: ["GET", "POST", "OPTIONS"],  // ✅ Added OPTIONS
-    credentials: false,  // ✅ Changed from true - mobile apps don't send credentials
-    allowedHeaders: ["Content-Type", "Authorization"]  // ✅ Added explicit headers
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+    methods: ["GET", "POST"],
+    credentials: true
   },
-  pingTimeout: 30000,
-  pingInterval: 15000,
-  upgradeTimeout: 30000,
-  transports: ['polling', 'websocket'],
-  allowEIO3: true,
-  connectTimeout: 30000,
-  maxHttpBufferSize: 1e6,
-  allowUpgrades: true,
-  perMessageDeflate: false,
-  
-  // ✅ ADD THESE for React Native compatibility:
-  cookie: false,  // Disable cookies for mobile
-  serveClient: false  // Don't serve client library
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  transports: ['websocket', 'polling'],
+  allowEIO3: true
 });
+
 // In-memory store for active connections
 const activeUsers = new Map();
 const userChatRooms = new Map();
