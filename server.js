@@ -33,30 +33,29 @@ const db = admin.firestore();
 const app = express();
 const server = http.createServer(app);
 
-const allowedOrigins = [
-  'https://kaiwa-chatbackend-production.up.railway.app',
-  
-];
+const corsOptions = {
+  origin: (origin, callback) => {
+    // ✅ React Native sends NO origin
+    if (!origin) return callback(null, true);
 
-// Enable CORS for all routes
-app.use(cors({
-  origin: allowedOrigins,
-  credentials: true
-}));
+    // ✅ Allow your Railway domain
+    if (origin === 'https://kaiwa-chatbackend-production.up.railway.app') {
+      return callback(null, true);
+    }
 
-app.use(express.json());
-
-// Socket.IO configuration
-const io = socketIo(server, {
-  cors: {
-    origin: allowedOrigins,
-    methods: ["GET", "POST"],
-    credentials: true
+    return callback(new Error('Not allowed by CORS'));
   },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
+
+const io = socketIo(server, {
+  path: '/socket.io',
+  cors: corsOptions,
+  transports: ['websocket'], // 🚫 NO polling
   pingTimeout: 60000,
   pingInterval: 25000,
-  transports: ['websocket', 'polling'],
-  allowEIO3: true
 });
 
 // In-memory store for active connections
