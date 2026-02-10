@@ -33,9 +33,14 @@ const db = admin.firestore();
 const app = express();
 const server = http.createServer(app);
 
+const allowedOrigins = [
+  'https://kaiwa-chatbackend-production.up.railway.app',
+  
+];
+
 // Enable CORS for all routes
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+  origin: allowedOrigins,
   credentials: true
 }));
 
@@ -44,7 +49,7 @@ app.use(express.json());
 // Socket.IO configuration
 const io = socketIo(server, {
   cors: {
-    origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
     credentials: true
   },
