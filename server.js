@@ -44,19 +44,24 @@ app.use(express.json());
 // Socket.IO configuration
 const io = socketIo(server, {
   cors: {
-    origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
-    methods: ["GET", "POST"],
-    credentials: true
+    origin: '*',  // ✅ Changed from process.env.ALLOWED_ORIGINS for mobile
+    methods: ["GET", "POST", "OPTIONS"],  // ✅ Added OPTIONS
+    credentials: false,  // ✅ Changed from true - mobile apps don't send credentials
+    allowedHeaders: ["Content-Type", "Authorization"]  // ✅ Added explicit headers
   },
-  pingTimeout: 30000,      // Reduced from 60000
-  pingInterval: 15000,     // Reduced from 25000
-  upgradeTimeout: 30000,   // Add this - timeout for transport upgrade
-  transports: ['polling', 'websocket'], // ✅ CRITICAL: Start with polling, then upgrade
+  pingTimeout: 30000,
+  pingInterval: 15000,
+  upgradeTimeout: 30000,
+  transports: ['polling', 'websocket'],
   allowEIO3: true,
-  connectTimeout: 30000,   // Add this - timeout for initial connection
-  maxHttpBufferSize: 1e6,  // Add this - 1MB buffer
-  allowUpgrades: true,     // Allow transport upgrades
-  perMessageDeflate: false // Disable compression for faster handshake
+  connectTimeout: 30000,
+  maxHttpBufferSize: 1e6,
+  allowUpgrades: true,
+  perMessageDeflate: false,
+  
+  // ✅ ADD THESE for React Native compatibility:
+  cookie: false,  // Disable cookies for mobile
+  serveClient: false  // Don't serve client library
 });
 // In-memory store for active connections
 const activeUsers = new Map();
