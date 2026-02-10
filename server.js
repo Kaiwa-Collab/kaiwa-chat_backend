@@ -48,12 +48,16 @@ const io = socketIo(server, {
     methods: ["GET", "POST"],
     credentials: true
   },
-  pingTimeout: 60000,
-  pingInterval: 25000,
-  transports: ['websocket', 'polling'],
-  allowEIO3: true
+  pingTimeout: 30000,      // Reduced from 60000
+  pingInterval: 15000,     // Reduced from 25000
+  upgradeTimeout: 30000,   // Add this - timeout for transport upgrade
+  transports: ['polling', 'websocket'], // ✅ CRITICAL: Start with polling, then upgrade
+  allowEIO3: true,
+  connectTimeout: 30000,   // Add this - timeout for initial connection
+  maxHttpBufferSize: 1e6,  // Add this - 1MB buffer
+  allowUpgrades: true,     // Allow transport upgrades
+  perMessageDeflate: false // Disable compression for faster handshake
 });
-
 // In-memory store for active connections
 const activeUsers = new Map();
 const userChatRooms = new Map();
