@@ -1,6 +1,6 @@
-// server.js - FINAL FIXED VERSION
+// server.js - PRODUCTION VERSION
 // WebSocket Chat Server with Firebase Integration
-// FIXES: Authentication middleware issue causing connection failures
+// Enhanced with better error handling and connection stability
 
 const express = require('express');
 const http = require('http');
@@ -19,9 +19,9 @@ if (!process.env.FIREBASE_CONFIG) {
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
   serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
-  console.log('Firebase config loaded');
+  console.log('✅ Firebase config loaded');
 } catch (err) {
-  console.error('Invalid FIREBASE_CONFIG JSON', err);
+  console.error('❌ Invalid FIREBASE_CONFIG JSON', err);
   process.exit(1);
 }
 
@@ -43,6 +43,11 @@ const corsOptions = {
       return callback(null, true);
     }
 
+    // ✅ Allow localhost for development
+    if (origin && origin.includes('localhost')) {
+      return callback(null, true);
+    }
+
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -50,12 +55,16 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
+// Socket.IO Server Configuration
 const io = socketIo(server, {
   path: '/socket.io',
   cors: corsOptions,
-  transports: ['websocket'], // 🚫 NO polling
-  pingTimeout: 60000,
-  pingInterval: 25000,
+  transports: ['websocket', 'polling'], // ✅ Support both transports
+  pingTimeout: 120000,        // ✅ 2 minutes (increased from 60s)
+  pingInterval: 25000,        // Keep at 25 seconds
+  upgradeTimeout: 30000,      // ✅ 30 seconds for upgrade
+  maxHttpBufferSize: 1e8,     // ✅ 100MB buffer size
+  allowEIO3: true,            // ✅ Backward compatibility
 });
 
 // In-memory store for active connections
@@ -69,7 +78,7 @@ async function verifyToken(token) {
     const decodedToken = await admin.auth().verifyIdToken(token);
     return decodedToken.uid;
   } catch (error) {
-    console.error('Token verification failed:', error);
+    console.error('Token verification failed:', error.message);
     return null;
   }
 }
@@ -92,6 +101,7 @@ async function getUserProfile(userId) {
     
     return data;
   } catch (error) {
+    console.error('Error fetching user profile:', error.message);
     return null;
   }
 }
@@ -103,7 +113,8 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     activeUsers: activeUsers.size,
     activeChats: chatParticipants.size,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
   });
 });
 
@@ -111,17 +122,20 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     message: 'Chat WebSocket Server Running',
-    version: '1.0.0',
+    version: '2.0.0',
     environment: process.env.NODE_ENV || 'development',
     endpoints: {
       health: '/health',
       messages: '/api/messages/:chatId'
+    },
+    stats: {
+      activeUsers: activeUsers.size,
+      activeChats: chatParticipants.size
     }
   });
 });
 
-// CRITICAL FIX: Socket.IO authentication middleware
-// This middleware runs BEFORE the 'connection' event
+// Socket.IO authentication middleware
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
@@ -144,14 +158,18 @@ io.use(async (socket, next) => {
     next();
     
   } catch (err) {
-    console.error('❌ Auth middleware error:', err);
+    console.error('❌ Auth middleware error:', err.message);
     return next(new Error('Authentication failed'));
   }
 });
 
 // Socket.io Connection Handler
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
+  console.log('====================================');
+  console.log('🔌 CLIENT CONNECTED');
+  console.log('====================================');
+  console.log('Socket ID:', socket.id);
+  console.log('Transport:', socket.conn.transport.name);
   
   // User is already authenticated by middleware
   const authenticatedUserId = socket.userId;
@@ -161,6 +179,9 @@ io.on('connection', (socket) => {
     socket.disconnect();
     return;
   }
+
+  console.log('👤 User ID:', authenticatedUserId);
+  console.log('====================================');
 
   // Track active user
   if (!activeUsers.has(authenticatedUserId)) {
@@ -173,7 +194,7 @@ io.on('connection', (socket) => {
     online: true,
     lastSeen: admin.firestore.FieldValue.serverTimestamp(),
     socketIds: admin.firestore.FieldValue.arrayUnion(socket.id)
-  }, { merge: true }).catch(err => console.error('Error updating presence:', err));
+  }, { merge: true }).catch(err => console.error('Error updating presence:', err.message));
 
   // Notify others that user is online
   socket.broadcast.emit('user_status_changed', {
@@ -185,6 +206,25 @@ io.on('connection', (socket) => {
   const onlineUserIds = Array.from(activeUsers.keys());
   socket.emit('authenticated', { userId: authenticatedUserId, onlineUserIds });
   console.log(`✅ User ${authenticatedUserId} fully authenticated and ready`);
+
+  // Add error handlers for the socket
+  socket.on('error', (error) => {
+    console.error(`Socket error for ${authenticatedUserId}:`, error.message);
+  });
+
+  // Track connection issues
+  socket.conn.on('error', (error) => {
+    console.error(`Connection error for ${authenticatedUserId}:`, error.message);
+  });
+
+  socket.conn.on('close', (reason) => {
+    console.log(`Connection closed for ${authenticatedUserId}:`, reason);
+  });
+
+  // Monitor transport upgrades
+  socket.conn.on('upgrade', (transport) => {
+    console.log(`✅ Transport upgraded to ${transport.name} for ${authenticatedUserId}`);
+  });
 
   // Join chat room
   socket.on('join_chat', async (data) => {
@@ -222,7 +262,7 @@ io.on('connection', (socket) => {
         chatId
       });
     } catch (error) {
-      console.error('Error joining chat:', error);
+      console.error('Error joining chat:', error.message);
       socket.emit('error', { message: 'Failed to join chat' });
     }
   });
@@ -315,7 +355,7 @@ io.on('connection', (socket) => {
       });
       
     } catch (error) {
-      console.error('Error sending message:', error);
+      console.error('Error sending message:', error.message);
       socket.emit('message_error', {
         tempId,
         error: 'Failed to send message'
@@ -345,7 +385,7 @@ io.on('connection', (socket) => {
       });
       
     } catch (error) {
-      console.error('Error marking delivered:', error);
+      console.error('Error marking delivered:', error.message);
     }
   });
 
@@ -371,7 +411,7 @@ io.on('connection', (socket) => {
       });
       
     } catch (error) {
-      console.error('Error marking read:', error);
+      console.error('Error marking read:', error.message);
     }
   });
 
@@ -406,13 +446,19 @@ io.on('connection', (socket) => {
       }
       socket.to(chatId).emit('message_updated', { chatId, message });
     } catch (error) {
-      console.error('Error broadcasting message_updated:', error);
+      console.error('Error broadcasting message_updated:', error.message);
     }
   });
 
   // Disconnect handler
-  socket.on('disconnect', async () => {
-    console.log('Client disconnected:', socket.id);
+  socket.on('disconnect', async (reason) => {
+    console.log('====================================');
+    console.log('⚠️ CLIENT DISCONNECTED');
+    console.log('====================================');
+    console.log('Socket ID:', socket.id);
+    console.log('User ID:', authenticatedUserId);
+    console.log('Reason:', reason);
+    console.log('====================================');
     
     const userSockets = activeUsers.get(authenticatedUserId);
     if (userSockets) {
@@ -433,7 +479,7 @@ io.on('connection', (socket) => {
             lastSeen: new Date().toISOString()
           });
         } catch (error) {
-          console.error('Error updating presence on disconnect:', error);
+          console.error('Error updating presence on disconnect:', error.message);
         }
       }
     }
@@ -500,19 +546,27 @@ app.get('/api/messages/:chatId', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('Error fetching messages:', error);
+    console.error('Error fetching messages:', error.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+// Graceful shutdown handling
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`WebSocket server running on port ${PORT}`);
+  console.log('====================================');
+  console.log('🚀 SERVER STARTED');
+  console.log('====================================');
+  console.log(`Port: ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Transports: websocket, polling`);
+  console.log(`Ping Timeout: 120s`);
+  console.log(`Ping Interval: 25s`);
+  console.log('====================================');
 });
 
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing server...');
+  console.log('SIGTERM received, closing server gracefully...');
   server.close(() => {
     console.log('Server closed');
     process.exit(0);
@@ -520,7 +574,7 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
-  console.log('SIGINT received, closing server...');
+  console.log('SIGINT received, closing server gracefully...');
   server.close(() => {
     console.log('Server closed');
     process.exit(0);
