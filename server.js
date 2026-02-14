@@ -39,7 +39,7 @@ const corsOptions = {
     if (!origin) return callback(null, true);
 
     // ✅ Allow your Railway domain
-    if (origin === 'https://kaiwa-chatbackend.up.railway.app') {
+    if (origin === 'https://kaiwa-chatbackend-production.up.railway.app') {
       return callback(null, true);
     }
 
