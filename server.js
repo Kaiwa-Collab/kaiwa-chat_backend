@@ -1,27 +1,58 @@
-// server.js - PRODUCTION VERSION
-// WebSocket Chat Server with Firebase Integration
-// Enhanced with better error handling and connection stability
-
+// server.js - PRODUCTION GRADE VERSION
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const admin = require('firebase-admin');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const morgan = require('morgan');
+const winston = require('winston');
+const { RateLimiterMemory } = require('rate-limiter-flexible');
+const Joi = require('joi');
+const LRU = require('lru-cache');
 
-// Initialize Firebase Admin
+// ============================================================================
+// LOGGING CONFIGURATION
+// ============================================================================
+
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'logs/combined.log' }),
+  ],
+});
+
+// Console logging in development
+if (process.env.NODE_ENV !== 'production') {
+  logger.add(new winston.transports.Console({
+    format: winston.format.simple(),
+  }));
+}
+
+// ============================================================================
+// FIREBASE INITIALIZATION
+// ============================================================================
+
 let serviceAccount;
 
 if (!process.env.FIREBASE_CONFIG) {
-  console.error('FIREBASE_CONFIG not set');
+  logger.error('FIREBASE_CONFIG not set');
   process.exit(1);
 }
 
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
   serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
-  console.log('✅ Firebase config loaded');
+  logger.info('✅ Firebase config loaded');
 } catch (err) {
-  console.error('❌ Invalid FIREBASE_CONFIG JSON', err);
+  logger.error('❌ Invalid FIREBASE_CONFIG JSON', err);
   process.exit(1);
 }
 
@@ -33,21 +64,121 @@ const db = admin.firestore();
 const app = express();
 const server = http.createServer(app);
 
+// ============================================================================
+// RATE LIMITERS
+// ============================================================================
+
+const rateLimiters = {
+  // Message sending: 10 messages per minute
+  message: new RateLimiterMemory({
+    points: 10,
+    duration: 60,
+    blockDuration: 60,
+  }),
+  
+  // Typing indicators: 5 per 10 seconds
+  typing: new RateLimiterMemory({
+    points: 5,
+    duration: 10,
+  }),
+  
+  // Mark read/delivered: 20 per minute
+  markStatus: new RateLimiterMemory({
+    points: 20,
+    duration: 60,
+  }),
+  
+  // Join/leave chat: 10 per minute
+  chatAction: new RateLimiterMemory({
+    points: 10,
+    duration: 60,
+  }),
+  
+  // API requests: 100 per minute
+  api: new RateLimiterMemory({
+    points: 100,
+    duration: 60,
+  }),
+};
+
+// ============================================================================
+// VALIDATION SCHEMAS
+// ============================================================================
+
+const schemas = {
+  sendMessage: Joi.object({
+    chatId: Joi.string().pattern(/^[a-zA-Z0-9_-]+$/).min(1).max(100).required(),
+    text: Joi.string().max(5000).allow(''),
+    mediaUrl: Joi.string().uri().max(500).allow(null),
+    mediaType: Joi.string().valid('text', 'image', 'video').allow(null),
+    tempId: Joi.string().max(100).required()
+  }),
+  
+  joinChat: Joi.object({
+    chatId: Joi.string().pattern(/^[a-zA-Z0-9_-]+$/).min(1).max(100).required()
+  }),
+  
+  markMessages: Joi.object({
+    chatId: Joi.string().pattern(/^[a-zA-Z0-9_-]+$/).min(1).max(100).required(),
+    messageIds: Joi.array().items(Joi.string().max(100)).min(1).max(50).required()
+  }),
+  
+  typing: Joi.object({
+    chatId: Joi.string().pattern(/^[a-zA-Z0-9_-]+$/).min(1).max(100).required()
+  })
+};
+
+// ============================================================================
+// CACHING WITH LRU (PREVENTS MEMORY LEAKS)
+// ============================================================================
+
+const userProfileCache = new LRU({
+  max: 1000, // Max 1000 profiles
+  maxAge: 5 * 60 * 1000, // 5 minutes
+});
+
+// ============================================================================
+// MIDDLEWARE
+// ============================================================================
+
+// Security headers
+app.use(helmet());
+
+// Compression
+app.use(compression());
+
+// HTTP logging
+app.use(morgan('combined', {
+  stream: { write: (message) => logger.info(message.trim()) }
+}));
+
+// Body parsing with size limits
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// CORS Configuration (SECURE)
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',')
+  : [];
+
 const corsOptions = {
   origin: (origin, callback) => {
-    // ✅ React Native sends NO origin
-    if (!origin) return callback(null, true);
-
-    // ✅ Allow your Railway domain
-    if (origin === 'https://kaiwa-chatbackend-production.up.railway.app') {
+    // React Native sends NO origin
+    if (!origin) {
       return callback(null, true);
     }
 
-    // ✅ Allow localhost for development
-    if (origin && origin.includes('localhost')) {
+    // Check whitelist
+    if (ALLOWED_ORIGINS.includes(origin)) {
       return callback(null, true);
     }
 
+    // Development localhost
+    if (process.env.NODE_ENV === 'development' && origin.includes('localhost')) {
+      return callback(null, true);
+    }
+
+    logger.warn(`CORS blocked: ${origin}`);
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -55,37 +186,45 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Socket.IO Server Configuration
+// ============================================================================
+// SOCKET.IO CONFIGURATION
+// ============================================================================
+
 const io = socketIo(server, {
   path: '/socket.io',
   cors: corsOptions,
-  transports: ['websocket', 'polling'], // ✅ Support both transports
-  pingTimeout: 120000,        // ✅ 2 minutes (increased from 60s)
-  pingInterval: 25000,        // Keep at 25 seconds
-  upgradeTimeout: 30000,      // ✅ 30 seconds for upgrade
-  maxHttpBufferSize: 1e8,     // ✅ 100MB buffer size
-  allowEIO3: true,            // ✅ Backward compatibility
+  transports: ['websocket', 'polling'],
+  pingTimeout: 120000,
+  pingInterval: 25000,
+  upgradeTimeout: 30000,
+  maxHttpBufferSize: 1e6, // 1MB (reduced from 100MB!)
+  allowEIO3: true,
 });
 
-// In-memory store for active connections
+// ============================================================================
+// IN-MEMORY STORES
+// ============================================================================
+
 const activeUsers = new Map();
 const userChatRooms = new Map();
 const chatParticipants = new Map();
 
-// Helper: Verify Firebase token
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
 async function verifyToken(token) {
   try {
     const decodedToken = await admin.auth().verifyIdToken(token);
     return decodedToken.uid;
   } catch (error) {
-    console.error('Token verification failed:', error.message);
+    logger.error('Token verification failed:', error.message);
     return null;
   }
 }
 
-// Helper: Get user profile (cached)
-const userProfileCache = new Map();
 async function getUserProfile(userId) {
+  // Check cache first
   if (userProfileCache.has(userId)) {
     return userProfileCache.get(userId);
   }
@@ -96,17 +235,35 @@ async function getUserProfile(userId) {
     
     if (data) {
       userProfileCache.set(userId, data);
-      setTimeout(() => userProfileCache.delete(userId), 5 * 60 * 1000);
     }
     
     return data;
   } catch (error) {
-    console.error('Error fetching user profile:', error.message);
+    logger.error('Error fetching user profile:', error.message);
     return null;
   }
 }
 
-// Health check endpoint
+// Validate input data
+function validateInput(schema, data) {
+  const { error, value } = schema.validate(data, {
+    abortEarly: false,
+    stripUnknown: true
+  });
+  
+  if (error) {
+    const errors = error.details.map(d => d.message).join(', ');
+    throw new Error(`Validation failed: ${errors}`);
+  }
+  
+  return value;
+}
+
+// ============================================================================
+// REST API ENDPOINTS
+// ============================================================================
+
+// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -118,14 +275,42 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Liveness probe (Kubernetes)
+app.get('/health/live', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+// Readiness probe (Kubernetes)
+app.get('/health/ready', async (req, res) => {
+  try {
+    // Check Firebase connection
+    await db.collection('health').doc('ping').get();
+    res.json({ status: 'ready' });
+  } catch (error) {
+    res.status(503).json({ status: 'not ready', error: error.message });
+  }
+});
+
+// Metrics endpoint
+app.get('/metrics', (req, res) => {
+  res.json({
+    activeUsers: activeUsers.size,
+    activeChats: chatParticipants.size,
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    cpuUsage: process.cpuUsage(),
+  });
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
     message: 'Chat WebSocket Server Running',
-    version: '2.0.0',
+    version: '2.1.0',
     environment: process.env.NODE_ENV || 'development',
     endpoints: {
       health: '/health',
+      metrics: '/metrics',
       messages: '/api/messages/:chatId'
     },
     stats: {
@@ -135,53 +320,122 @@ app.get('/', (req, res) => {
   });
 });
 
-// Socket.IO authentication middleware
+// Fetch message history (with rate limiting)
+app.get('/api/messages/:chatId', async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { limit = 50, before } = req.query;
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    const userId = await verifyToken(token);
+    if (!userId) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    // Rate limiting
+    try {
+      await rateLimiters.api.consume(userId);
+    } catch (rateLimitError) {
+      return res.status(429).json({ 
+        error: 'Too many requests',
+        retryAfter: Math.ceil(rateLimitError.msBeforeNext / 1000)
+      });
+    }
+    
+    // Validate chatId
+    if (!/^[a-zA-Z0-9_-]+$/.test(chatId) || chatId.length > 100) {
+      return res.status(400).json({ error: 'Invalid chatId' });
+    }
+    
+    const chatDoc = await db.collection('chats').doc(chatId).get();
+    if (!chatDoc.exists || !chatDoc.data().participants.includes(userId)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    // Validate and parse limit
+    const parsedLimit = Math.min(Math.max(parseInt(limit) || 50, 1), 100);
+    
+    let query = db.collection('chats')
+      .doc(chatId)
+      .collection('messages')
+      .orderBy('createdAt', 'desc')
+      .limit(parsedLimit);
+    
+    if (before) {
+      query = query.startAfter(new Date(before));
+    }
+    
+    const snapshot = await query.get();
+    const messages = snapshot.docs
+      .map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate().toISOString()
+      }))
+      .filter(msg => {
+        const deletedFor = msg.deletedFor || {};
+        return !deletedFor[userId];
+      });
+    
+    res.json({
+      messages,
+      hasMore: snapshot.size === parsedLimit
+    });
+    
+  } catch (error) {
+    logger.error('Error fetching messages:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// SOCKET.IO AUTHENTICATION MIDDLEWARE
+// ============================================================================
+
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
     
     if (!token) {
-      console.log('❌ No token provided in handshake');
+      logger.warn('No token provided in handshake');
       return next(new Error('Authentication required'));
     }
 
-    console.log('🔐 Verifying token...');
     const userId = await verifyToken(token);
     
     if (!userId) {
-      console.log('❌ Invalid token');
+      logger.warn('Invalid token');
       return next(new Error('Invalid token'));
     }
 
-    console.log(`✅ Token verified for user: ${userId}`);
+    logger.info(`Token verified for user: ${userId}`);
     socket.userId = userId;
     next();
     
   } catch (err) {
-    console.error('❌ Auth middleware error:', err.message);
+    logger.error('Auth middleware error:', err.message);
     return next(new Error('Authentication failed'));
   }
 });
 
-// Socket.io Connection Handler
+// ============================================================================
+// SOCKET.IO CONNECTION HANDLER
+// ============================================================================
+
 io.on('connection', (socket) => {
-  console.log('====================================');
-  console.log('🔌 CLIENT CONNECTED');
-  console.log('====================================');
-  console.log('Socket ID:', socket.id);
-  console.log('Transport:', socket.conn.transport.name);
-  
-  // User is already authenticated by middleware
   const authenticatedUserId = socket.userId;
 
   if (!authenticatedUserId) {
-    console.error('❌ No userId on socket - middleware failed');
+    logger.error('No userId on socket - middleware failed');
     socket.disconnect();
     return;
   }
 
-  console.log('👤 User ID:', authenticatedUserId);
-  console.log('====================================');
+  logger.info(`Client connected: ${socket.id}, User: ${authenticatedUserId}`);
 
   // Track active user
   if (!activeUsers.has(authenticatedUserId)) {
@@ -189,48 +443,44 @@ io.on('connection', (socket) => {
   }
   activeUsers.get(authenticatedUserId).add(socket.id);
 
-  // Update online status in Firestore
+  // Update online status
   db.collection('presence').doc(authenticatedUserId).set({
     online: true,
     lastSeen: admin.firestore.FieldValue.serverTimestamp(),
     socketIds: admin.firestore.FieldValue.arrayUnion(socket.id)
-  }, { merge: true }).catch(err => console.error('Error updating presence:', err.message));
+  }, { merge: true }).catch(err => logger.error('Error updating presence:', err));
 
-  // Notify others that user is online
+  // Notify others
   socket.broadcast.emit('user_status_changed', {
     userId: authenticatedUserId,
     status: 'online'
   });
 
-  // Send authenticated event with online users
+  // Send authenticated event
   const onlineUserIds = Array.from(activeUsers.keys());
   socket.emit('authenticated', { userId: authenticatedUserId, onlineUserIds });
-  console.log(`✅ User ${authenticatedUserId} fully authenticated and ready`);
 
-  // Add error handlers for the socket
-  socket.on('error', (error) => {
-    console.error(`Socket error for ${authenticatedUserId}:`, error.message);
-  });
-
-  // Track connection issues
-  socket.conn.on('error', (error) => {
-    console.error(`Connection error for ${authenticatedUserId}:`, error.message);
-  });
-
-  socket.conn.on('close', (reason) => {
-    console.log(`Connection closed for ${authenticatedUserId}:`, reason);
-  });
-
-  // Monitor transport upgrades
-  socket.conn.on('upgrade', (transport) => {
-    console.log(`✅ Transport upgraded to ${transport.name} for ${authenticatedUserId}`);
-  });
-
-  // Join chat room
+  // ============================================================================
+  // JOIN CHAT
+  // ============================================================================
+  
   socket.on('join_chat', async (data) => {
-    const { chatId } = data;
-    
     try {
+      // Rate limiting
+      try {
+        await rateLimiters.chatAction.consume(authenticatedUserId);
+      } catch (rateLimitError) {
+        socket.emit('error', { 
+          message: 'Rate limit exceeded. Please slow down.',
+          code: 'RATE_LIMIT'
+        });
+        return;
+      }
+      
+      // Validate input
+      const validData = validateInput(schemas.joinChat, data);
+      const { chatId } = validData;
+      
       const chatDoc = await db.collection('chats').doc(chatId).get();
       if (!chatDoc.exists) {
         socket.emit('error', { message: 'Chat not found' });
@@ -255,42 +505,78 @@ io.on('connection', (socket) => {
       }
       chatParticipants.get(chatId).add(authenticatedUserId);
       
-      console.log(`User ${authenticatedUserId} joined chat ${chatId}`);
+      logger.info(`User ${authenticatedUserId} joined chat ${chatId}`);
       
       socket.to(chatId).emit('user_joined_chat', {
         userId: authenticatedUserId,
         chatId
       });
     } catch (error) {
-      console.error('Error joining chat:', error.message);
-      socket.emit('error', { message: 'Failed to join chat' });
+      logger.error('Error joining chat:', error);
+      socket.emit('error', { message: error.message || 'Failed to join chat' });
     }
   });
 
-  // Leave chat room
+  // ============================================================================
+  // LEAVE CHAT
+  // ============================================================================
+  
   socket.on('leave_chat', (data) => {
-    const { chatId } = data;
-    socket.leave(chatId);
-    
-    if (userChatRooms.has(authenticatedUserId)) {
-      userChatRooms.get(authenticatedUserId).delete(chatId);
+    try {
+      const validData = validateInput(schemas.joinChat, data);
+      const { chatId } = validData;
+      
+      socket.leave(chatId);
+      
+      if (userChatRooms.has(authenticatedUserId)) {
+        userChatRooms.get(authenticatedUserId).delete(chatId);
+      }
+      
+      if (chatParticipants.has(chatId)) {
+        chatParticipants.get(chatId).delete(authenticatedUserId);
+      }
+      
+      socket.to(chatId).emit('user_left_chat', {
+        userId: authenticatedUserId,
+        chatId
+      });
+    } catch (error) {
+      logger.error('Error leaving chat:', error);
     }
-    
-    if (chatParticipants.has(chatId)) {
-      chatParticipants.get(chatId).delete(authenticatedUserId);
-    }
-    
-    socket.to(chatId).emit('user_left_chat', {
-      userId: authenticatedUserId,
-      chatId
-    });
   });
 
-  // Send message
+  // ============================================================================
+  // SEND MESSAGE
+  // ============================================================================
+  
   socket.on('send_message', async (data) => {
-    const { chatId, text, mediaUrl, mediaType, tempId } = data;
-    
     try {
+      // Rate limiting
+      try {
+        await rateLimiters.message.consume(authenticatedUserId);
+      } catch (rateLimitError) {
+        logger.warn(`Rate limit exceeded for user ${authenticatedUserId}`);
+        socket.emit('message_error', {
+          tempId: data.tempId,
+          error: 'Too many messages. Please slow down.',
+          code: 'RATE_LIMIT'
+        });
+        return;
+      }
+      
+      // Validate input
+      const validData = validateInput(schemas.sendMessage, data);
+      const { chatId, text, mediaUrl, mediaType, tempId } = validData;
+      
+      // Additional validation for text or media
+      if (!text && !mediaUrl) {
+        socket.emit('message_error', {
+          tempId,
+          error: 'Message must have text or media'
+        });
+        return;
+      }
+      
       const messageRef = db.collection('chats').doc(chatId).collection('messages').doc();
       
       const messageData = {
@@ -307,7 +593,12 @@ io.on('connection', (socket) => {
       
       await messageRef.set(messageData);
       
+      // Verify write succeeded
       const savedDoc = await messageRef.get();
+      if (!savedDoc.exists) {
+        throw new Error('Message not persisted to database');
+      }
+      
       const savedData = savedDoc.data();
       
       const finalMessage = {
@@ -323,7 +614,7 @@ io.on('connection', (socket) => {
         status: 'sent'
       };
 
-      // Emit to others in chat
+      // Emit to others
       socket.to(chatId).emit('new_message', finalMessage);
       
       // Confirm to sender
@@ -340,7 +631,7 @@ io.on('connection', (socket) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
-      // Notify all user's devices
+      // Notify all devices
       const participants = chatParticipants.get(chatId) || new Set();
       participants.forEach(participantId => {
         const sockets = activeUsers.get(participantId);
@@ -354,20 +645,34 @@ io.on('connection', (socket) => {
         }
       });
       
+      logger.info(`Message sent in chat ${chatId} by ${authenticatedUserId}`);
+      
     } catch (error) {
-      console.error('Error sending message:', error.message);
+      logger.error('Error sending message:', error);
       socket.emit('message_error', {
-        tempId,
-        error: 'Failed to send message'
+        tempId: data.tempId,
+        error: error.message || 'Failed to send message'
       });
     }
   });
 
-  // Mark messages as delivered
+  // ============================================================================
+  // MARK DELIVERED
+  // ============================================================================
+  
   socket.on('mark_delivered', async (data) => {
-    const { chatId, messageIds } = data;
-    
     try {
+      // Rate limiting
+      try {
+        await rateLimiters.markStatus.consume(authenticatedUserId);
+      } catch (rateLimitError) {
+        return; // Silently fail for non-critical operation
+      }
+      
+      // Validate input
+      const validData = validateInput(schemas.markMessages, data);
+      const { chatId, messageIds } = validData;
+      
       const batch = db.batch();
       
       messageIds.forEach(messageId => {
@@ -385,15 +690,27 @@ io.on('connection', (socket) => {
       });
       
     } catch (error) {
-      console.error('Error marking delivered:', error.message);
+      logger.error('Error marking delivered:', error);
     }
   });
 
-  // Mark messages as read
+  // ============================================================================
+  // MARK READ
+  // ============================================================================
+  
   socket.on('mark_read', async (data) => {
-    const { chatId, messageIds } = data;
-    
     try {
+      // Rate limiting
+      try {
+        await rateLimiters.markStatus.consume(authenticatedUserId);
+      } catch (rateLimitError) {
+        return; // Silently fail
+      }
+      
+      // Validate input
+      const validData = validateInput(schemas.markMessages, data);
+      const { chatId, messageIds } = validData;
+      
       const batch = db.batch();
       
       messageIds.forEach(messageId => {
@@ -411,30 +728,55 @@ io.on('connection', (socket) => {
       });
       
     } catch (error) {
-      console.error('Error marking read:', error.message);
+      logger.error('Error marking read:', error);
     }
   });
 
-  // Typing indicators
+  // ============================================================================
+  // TYPING INDICATORS
+  // ============================================================================
+  
   socket.on('typing_start', (data) => {
-    const { chatId } = data;
-    socket.to(chatId).emit('user_typing', {
-      userId: authenticatedUserId,
-      chatId,
-      isTyping: true
-    });
+    try {
+      // Rate limiting
+      rateLimiters.typing.consume(authenticatedUserId)
+        .then(() => {
+          const validData = validateInput(schemas.typing, data);
+          const { chatId } = validData;
+          
+          socket.to(chatId).emit('user_typing', {
+            userId: authenticatedUserId,
+            chatId,
+            isTyping: true
+          });
+        })
+        .catch(() => {
+          // Silently fail rate limit for typing
+        });
+    } catch (error) {
+      // Silently fail validation errors for typing
+    }
   });
 
   socket.on('typing_stop', (data) => {
-    const { chatId } = data;
-    socket.to(chatId).emit('user_typing', {
-      userId: authenticatedUserId,
-      chatId,
-      isTyping: false
-    });
+    try {
+      const validData = validateInput(schemas.typing, data);
+      const { chatId } = validData;
+      
+      socket.to(chatId).emit('user_typing', {
+        userId: authenticatedUserId,
+        chatId,
+        isTyping: false
+      });
+    } catch (error) {
+      // Silently fail
+    }
   });
 
-  // Message updated
+  // ============================================================================
+  // MESSAGE UPDATED
+  // ============================================================================
+  
   socket.on('message_updated', async (data) => {
     const { chatId, message } = data;
     if (!chatId || !message) return;
@@ -446,19 +788,16 @@ io.on('connection', (socket) => {
       }
       socket.to(chatId).emit('message_updated', { chatId, message });
     } catch (error) {
-      console.error('Error broadcasting message_updated:', error.message);
+      logger.error('Error broadcasting message_updated:', error);
     }
   });
 
-  // Disconnect handler
+  // ============================================================================
+  // DISCONNECT
+  // ============================================================================
+  
   socket.on('disconnect', async (reason) => {
-    console.log('====================================');
-    console.log('⚠️ CLIENT DISCONNECTED');
-    console.log('====================================');
-    console.log('Socket ID:', socket.id);
-    console.log('User ID:', authenticatedUserId);
-    console.log('Reason:', reason);
-    console.log('====================================');
+    logger.info(`Client disconnected: ${socket.id}, User: ${authenticatedUserId}, Reason: ${reason}`);
     
     const userSockets = activeUsers.get(authenticatedUserId);
     if (userSockets) {
@@ -479,7 +818,7 @@ io.on('connection', (socket) => {
             lastSeen: new Date().toISOString()
           });
         } catch (error) {
-          console.error('Error updating presence on disconnect:', error.message);
+          logger.error('Error updating presence on disconnect:', error);
         }
       }
     }
@@ -495,88 +834,67 @@ io.on('connection', (socket) => {
       userChatRooms.delete(authenticatedUserId);
     }
   });
+
+  // ============================================================================
+  // ERROR HANDLERS
+  // ============================================================================
+  
+  socket.on('error', (error) => {
+    logger.error(`Socket error for ${authenticatedUserId}:`, error);
+  });
+
+  socket.conn.on('error', (error) => {
+    logger.error(`Connection error for ${authenticatedUserId}:`, error);
+  });
 });
 
-// REST API for fetching message history
-app.get('/api/messages/:chatId', async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const { limit = 50, before } = req.query;
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    
-    const userId = await verifyToken(token);
-    if (!userId) {
-      return res.status(401).json({ error: 'Invalid token' });
-    }
-    
-    const chatDoc = await db.collection('chats').doc(chatId).get();
-    if (!chatDoc.exists || !chatDoc.data().participants.includes(userId)) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    
-    let query = db.collection('chats')
-      .doc(chatId)
-      .collection('messages')
-      .orderBy('createdAt', 'desc')
-      .limit(parseInt(limit));
-    
-    if (before) {
-      query = query.startAfter(new Date(before));
-    }
-    
-    const snapshot = await query.get();
-    const messages = snapshot.docs
-      .map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-        createdAt: doc.data().createdAt?.toDate().toISOString()
-      }))
-      .filter(msg => {
-        const deletedFor = msg.deletedFor || {};
-        return !deletedFor[userId];
-      });
-    
-    res.json({
-      messages,
-      hasMore: snapshot.size === parseInt(limit)
-    });
-    
-  } catch (error) {
-    console.error('Error fetching messages:', error.message);
-    res.status(500).json({ error: 'Internal server error' });
-  }
+// ============================================================================
+// GLOBAL ERROR HANDLERS
+// ============================================================================
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-// Graceful shutdown handling
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error);
+  // Graceful shutdown
+  server.close(() => {
+    process.exit(1);
+  });
+});
+
+// ============================================================================
+// START SERVER
+// ============================================================================
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('====================================');
-  console.log('🚀 SERVER STARTED');
-  console.log('====================================');
-  console.log(`Port: ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`Transports: websocket, polling`);
-  console.log(`Ping Timeout: 120s`);
-  console.log(`Ping Interval: 25s`);
-  console.log('====================================');
+  logger.info('====================================');
+  logger.info('🚀 SERVER STARTED');
+  logger.info('====================================');
+  logger.info(`Port: ${PORT}`);
+  logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  logger.info(`Version: 2.1.0 (Production Hardened)`);
+  logger.info('====================================');
 });
 
+// ============================================================================
+// GRACEFUL SHUTDOWN
+// ============================================================================
+
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing server gracefully...');
+  logger.info('SIGTERM received, closing server gracefully...');
   server.close(() => {
-    console.log('Server closed');
+    logger.info('Server closed');
     process.exit(0);
   });
 });
 
 process.on('SIGINT', () => {
-  console.log('SIGINT received, closing server gracefully...');
+  logger.info('SIGINT received, closing server gracefully...');
   server.close(() => {
-    console.log('Server closed');
+    logger.info('Server closed');
     process.exit(0);
   });
 });
