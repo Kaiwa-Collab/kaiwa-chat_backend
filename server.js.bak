@@ -386,31 +386,31 @@ app.get('/api/messages/:chatId', async (req, res) => {
 // SOCKET.IO AUTHENTICATION MIDDLEWARE
 // ============================================================================
 
-io.use(async (socket, next) => {
-  try {
-    const token = socket.handshake.auth?.token;
+//io.use(async (socket, next) => {
+  //try {
+    //const token = socket.handshake.auth?.token;
     
-    if (!token) {
-      logger.warn('No token provided in handshake');
-      return next(new Error('Authentication required'));
-    }
+    //if (!token) {
+      //logger.warn('No token provided in handshake');
+      //return next(new Error('Authentication required'));
+    //}
 
-    const userId = await verifyToken(token);
+    //const userId = await verifyToken(token);
     
-    if (!userId) {
-      logger.warn('Invalid token');
-      return next(new Error('Invalid token'));
-    }
+    //if (!userId) {
+      //logger.warn('Invalid token');
+      //return next(new Error('Invalid token'));
+    //}
 
-    logger.info(`Token verified for user: ${userId}`);
-    socket.userId = userId;
-   next();
+    //logger.info(`Token verified for user: ${userId}`);
+    //socket.userId = userId;
+  //  next();
     
-  } catch (err) {
-    logger.error('Auth middleware error:', err.message);
-   return next(new Error('Authentication failed'));
-  }
-});
+  //} catch (err) {
+    //logger.error('Auth middleware error:', err.message);
+   // return next(new Error('Authentication failed'));
+  //}
+//});
 
 // ============================================================================
 // SOCKET.IO CONNECTION HANDLER
