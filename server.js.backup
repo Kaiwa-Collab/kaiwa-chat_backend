@@ -356,9 +356,7 @@ app.get('/api/messages/:chatId', async (req, res) => {
       .limit(parsedLimit);
     
     if (before) {
-      const cursorDoc = await db.collection('chats').doc(chatId).collection('messages').doc(before).get();
-      if (!cursorDoc.exists) { return res.status(400).json({ error: 'Cursor message not found' }); }
-      query = query.startAfter(cursorDoc);
+      query = query.startAfter(new Date(before));
     }
     
     const snapshot = await query.get();
